@@ -49,7 +49,7 @@ RUN chown -R appuser:appuser /app
 USER appuser
 
 # Expose the default port for the proxy
-EXPOSE 2500
+EXPOSE 2500/tcp
 
 # Set the command to run the application
 # IMPORTANT: The application must listen on 0.0.0.0 to be accessible from outside the container.
