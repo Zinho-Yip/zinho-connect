@@ -185,6 +185,7 @@ class ThreadedServer(object):
                 logger.info(f"HTTP {method} for {server_name}:{server_port}")
 
                 remote_obj = remote.Remote(server_name, server_port)
+                remote_obj.is_http_forward = True # 设置HTTP转发标志
                 
                 # Rebuild the request with a relative path
                 path = parsed_url.path or '/'
@@ -213,12 +214,44 @@ class ThreadedServer(object):
             return None, None  
 
     def my_upstream(self, client_sock):
-        first_flag = True
         backend_sock, data = self.handle_client_request(client_sock)
         if backend_sock is None:
             client_sock.close()
             return
-            
+
+        # HTTP转发的专用逻辑
+        if getattr(backend_sock, 'is_http_forward', False):
+            try:
+                backend_sock.client_sock = client_sock
+                backend_sock.connect()
+                
+                # 启动下行线程，负责将目标服务器的响应传回客户端
+                thread_down = threading.Thread(target=self.my_downstream, args=(backend_sock, client_sock))
+                thread_down.daemon = True
+                thread_down.start()
+                
+                # 发送初始请求数据
+                if data:
+                    backend_sock.send(data)
+                
+                # 继续作为管道，转发客户端可能发送的后续数据（例如POST请求的body）
+                global ThreadtoWork
+                while ThreadtoWork:
+                    more_data = client_sock.recv(16384)
+                    if more_data:
+                        backend_sock.send(more_data)
+                    else:
+                        # 客户端关闭了连接
+                        break
+            except Exception as e:
+                logger.info(f"Upstream (HTTP Forward): {repr(e)} from {backend_sock.domain}")
+            finally:
+                client_sock.close()
+                backend_sock.close()
+            return
+
+        # 原有的TLS/SOCKS5处理逻辑
+        first_flag = True
         global ThreadtoWork
         while ThreadtoWork:
             try:
