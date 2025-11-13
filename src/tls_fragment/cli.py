@@ -1,4 +1,5 @@
 from .log import logger
+from urllib.parse import urlparse
 from pathlib import Path
 import socket
 import os
@@ -69,7 +70,7 @@ class ThreadedServer(object):
             initial_data = client_socket.recv(5, socket.MSG_PEEK)
             if not initial_data:
                 client_socket.close()
-                return None
+                return None, None
 
             # 协议分流判断
             if initial_data[0] == 0x05:  # SOCKS5协议
@@ -80,10 +81,10 @@ class ThreadedServer(object):
         except Exception as e:
             logger.error(f"协议检测异常: {repr(e)}")
             client_socket.close()
-            return None
+            return None, None
 
     def _handle_socks5(self, client_socket):
-        """处理SOCKS5协议连接，保持与原有返回格式一致"""
+        """处理SOCKS5协议连接，返回(remote_obj, None)"""
         try:
             # 认证协商阶段
             client_socket.recv(2)  # 已经通过peek确认版本
@@ -122,21 +123,24 @@ class ThreadedServer(object):
                 client_socket.sendall(
                     b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00"
                 )
-                return remote_obj
+                return remote_obj, None
             except Exception as e:
                 logger.info(f"连接失败: {repr(e)}")
                 client_socket.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
                 client_socket.close()
-                return server_name if utils.is_ip_address(server_name) else None
+                return None, None
 
         except Exception as e:
             logger.info(f"SOCKS5处理错误: {repr(e)}")
             client_socket.close()
-            return None
+            return None, None
 
     def _handle_http_protocol(self, client_socket):
-        """原有HTTP处理逻辑完整保留"""
+        """HTTP处理逻辑，支持CONNECT和GET转发"""
         data = client_socket.recv(16384)
+        if not data:
+            client_socket.close()
+            return None, None
 
         # 原有CONNECT处理
         if data.startswith(b"CONNECT "):
@@ -148,28 +152,56 @@ class ThreadedServer(object):
                 client_socket.sendall(
                     b"HTTP/1.1 200 Connection established\r\nProxy-agent: MyProxy/1.0\r\n\r\n"
                 )
-                return remote_obj
+                return remote_obj, None
             except Exception as e:
                 logger.info(f"连接失败: {repr(e)}")
                 client_socket.sendall(
                     b"HTTP/1.1 502 Bad Gateway\r\nProxy-agent : MyProxy/1.0\r\n\r\n"
                 )
                 client_socket.close()
-                return server_name if utils.is_ip_address(server_name) else None
+                return None, None
 
         # 原有PAC文件处理
         elif b"/proxy.pac" in data.splitlines()[0]:
             response = load_pac()
             client_socket.sendall(response.encode())
             client_socket.close()
-            return None
+            return None, None
 
-        # 原有HTTP重定向逻辑
+        # 新增：HTTP转发逻辑
         elif data.startswith((b'GET ', b'PUT ', b'DELETE ', b'POST ', b'HEAD ', b'OPTIONS ')):
-            response = utils.generate_302(data,"github.com")
-            client_socket.sendall(response.encode(encoding="UTF-8"))
-            client_socket.close()
-            return None
+            try:
+                lines = data.split(b'\r\n')
+                request_line = lines[0].decode('utf-8')
+                method, url_str, version = request_line.split(' ', 2)
+                
+                parsed_url = urlparse(url_str)
+                server_name = parsed_url.hostname
+                server_port = parsed_url.port or 80
+                
+                if not server_name:
+                    raise ValueError("Could not parse hostname from request")
+
+                logger.info(f"HTTP {method} for {server_name}:{server_port}")
+
+                remote_obj = remote.Remote(server_name, server_port)
+                
+                # Rebuild the request with a relative path
+                path = parsed_url.path or '/'
+                if parsed_url.query:
+                    path += '?' + parsed_url.query
+                
+                new_request_line = f"{method} {path} {version}".encode('utf-8')
+                modified_data = new_request_line + b'\r\n' + b'\r\n'.join(lines[1:])
+                
+                return remote_obj, modified_data
+            except Exception as e:
+                logger.error(f"Failed to handle HTTP forward request: {repr(e)}")
+                client_socket.sendall(
+                    b"HTTP/1.1 502 Bad Gateway\r\nProxy-agent : MyProxy/1.0\r\n\r\n"
+                )
+                client_socket.close()
+                return None, None
 
         # 原有错误处理
         else:
@@ -178,12 +210,12 @@ class ThreadedServer(object):
                 b"HTTP/1.1 400 Bad Request\r\nProxy-agent: MyProxy/1.0\r\n\r\n"
             )
             client_socket.close()
-            return None  
+            return None, None  
 
     def my_upstream(self, client_sock):
         first_flag = True
-        backend_sock = self.handle_client_request(client_sock)
-        if backend_sock == None:
+        backend_sock, data = self.handle_client_request(client_sock)
+        if backend_sock is None:
             client_sock.close()
             return
             
@@ -196,7 +228,8 @@ class ThreadedServer(object):
                     time.sleep(
                         0.1
                     )  # speed control + waiting for packet to fully recieve
-                    data = client_sock.recv(16384)
+                    if not data:
+                        data = client_sock.recv(16384)
 
                     try:
                         extractedsni = utils.extract_sni(data)
