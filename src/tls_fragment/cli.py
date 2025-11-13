@@ -136,7 +136,7 @@ class ThreadedServer(object):
             return None, None
 
     def _handle_http_protocol(self, client_socket):
-        """HTTP处理逻辑，支持CONNECT和GET转发"""
+        """HTTP处理逻辑，支持CONNECT和GET的转发"""
         data = client_socket.recv(16384)
         if not data:
             client_socket.close()
