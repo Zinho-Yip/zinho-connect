@@ -56,6 +56,9 @@
 		}
 	},
 	"domains": {
+		"cdn.zinhoyip.dpdns.org": {
+			"safety_check": false
+		},
 		"pximg.net": {
 			"IP": "104.21.3.221"
 		},
